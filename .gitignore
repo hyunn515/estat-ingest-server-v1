@@ -1,0 +1,24 @@
+# Binaries
+estat-server
+*.exe
+
+# Go build
+*.test
+*.prof
+
+# Local config
+.env
+*.pem
+*.key
+
+# Temporary / DLQ
+dlq/
+*.dlq
+
+# Logs
+*.log
+
+# System / IDE
+.DS_Store
+.idea/
+.vscode/
