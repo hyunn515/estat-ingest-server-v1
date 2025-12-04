@@ -1,27 +1,3 @@
-물론 가능합니다.
-아래는 README.md + docs/ 전체 구성을 “한 번에 완성된 형태”로 제공합니다.
-이 상태 그대로 복사 후 GitHub에 배치하면 됩니다.
-
-구성물:
-
-README.md
-docs/
- ├── architecture.md
- ├── pipeline.md
- ├── dlq.md
- ├── shutdown.md
- ├── tuning.md
- └── ops.md
-
-각 문서는 서로 중복 없이, 실제 운영자가 “코드 없이 문서만 읽어도 시스템을 완전히 이해할 수 있을 수준”으로 작성되어 있습니다.
-(설명은 모두 최신 코드 구조 및 개선 사항을 반영한 운영용 기준입니다.)
-
-⸻
-
-📄 README.md
-
-(최종 완성본)
-
 ⸻
 
 Estat Ingest Server v1
