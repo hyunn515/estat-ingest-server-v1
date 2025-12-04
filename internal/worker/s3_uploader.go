@@ -51,7 +51,7 @@ func newS3Client(cfg config.Config) *s3.Client {
 	}
 
 	client := s3.NewFromConfig(awsCfg, func(o *s3.Options) {
-		o.RetryMaxAttempts = cfg.S3MaxRetries
+		o.RetryMaxAttempts = 0
 	})
 
 	return client
@@ -74,7 +74,7 @@ func (u *S3Uploader) UploadBytesWithRetryCtx(
 	var lastErr error
 	backoff := 200 * time.Millisecond
 
-	for attempt := 1; attempt <= u.cfg.S3MaxRetries; attempt++ {
+	for attempt := 1; attempt <= u.cfg.S3AppRetries; attempt++ {
 
 		// shutdown 체크
 		select {
@@ -124,7 +124,7 @@ func (u *S3Uploader) UploadFileWithRetryCtx(
 	var lastErr error
 	backoff := 200 * time.Millisecond
 
-	for attempt := 1; attempt <= u.cfg.S3MaxRetries; attempt++ {
+	for attempt := 1; attempt <= u.cfg.S3AppRetries; attempt++ {
 
 		// shutdown 체크
 		select {
@@ -175,7 +175,7 @@ func (u *S3Uploader) putObject(
 ) error {
 
 	// 1회 시도당 timeout 적용
-	ctx2, cancel := context.WithTimeout(ctx, 5*time.Second)
+	ctx2, cancel := context.WithTimeout(ctx, u.cfg.S3Timeout)
 	defer cancel()
 
 	_, err := u.client.PutObject(ctx2, &s3.PutObjectInput{

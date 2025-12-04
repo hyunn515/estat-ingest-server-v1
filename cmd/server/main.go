@@ -111,13 +111,19 @@ func main() {
 	//
 	// IdleTimeout:
 	//  - ALB → ECS 연결에서 keep-alive 연결 관리 목적
+	//  - 주의: ALB Idle Timeout 보다 "조금 더 길게" 설정하는 것이 안전하다.
+	//    - 예: ALB Idle Timeout = 60초라면, 서버는 65초로 설정
+	//    - 이유: 둘 다 60초면, 서버와 ALB가 동시에 연결을 끊으려다
+	//      경계 조건에서 502가 발생할 수 있다.
+	//    - 서버를 더 길게 가져가면, 항상 ALB가 먼저 연결을 정리하게 되어
+	//      502/504 발생 가능성이 줄어든다.
 	// ====================================================================
 	srv := &http.Server{
 		Addr:         cfg.HTTPAddr,
 		Handler:      mux,
 		ReadTimeout:  8 * time.Second,
 		WriteTimeout: 8 * time.Second,
-		IdleTimeout:  60 * time.Second,
+		IdleTimeout:  65 * time.Second,
 	}
 
 	// ====================================================================

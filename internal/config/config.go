@@ -15,9 +15,6 @@ import (
 // 서비스 실행 시 필요한 모든 환경 변수 값을 보관하는 구조체.
 // 모든 값은 프로세스 시작 시점에 Load() 에 의해 초기화되며,
 // 이후에는 변경되지 않는 불변(read-only) 설정들이다.
-//
-// 운영/개발 환경 인프라 팀이 설정해야 할 값들이므로,
-// 필드 하나하나가 의미하는 바를 주석으로 명확히 남겨둔다.
 type Config struct {
 
 	// ---------------------------
@@ -34,7 +31,7 @@ type Config struct {
 	// 서버 식별자 / 네트워크
 	// ---------------------------
 
-	InstanceID string // 이 ingest 프로세스 고유 ID (호스트명 기반, 실패 시 랜덤)
+	InstanceID string // ingest 프로세스 고유 ID (호스트명 기반, 실패 시 랜덤 hex)
 	HTTPAddr   string // HTTP 서버 bind 주소 (예: ":8080")
 
 	// ---------------------------
@@ -50,24 +47,32 @@ type Config struct {
 	// ---------------------------
 	// S3 업로드 설정
 	// ---------------------------
+	// Retry 정책 단일화
+	// --------------------------------------------
+	// AWS SDK v2 기본 retry는 서비스 상황에 따라 3회까지 수행되며,
+	// 코드 레벨 retry 와 겹치면 예측 불가능한 처리 지연이 발생한다.
+	//
+	// → 운영 안정성을 위해 SDK Retry는 코드에서 0으로 고정한다.
+	// → "재시도 횟수"는 오직 애플리케이션 레벨(S3AppRetries)만 사용한다.
+	// --------------------------------------------
 
-	S3Timeout    time.Duration // 각 S3 PutObject attempt의 timeout
-	S3MaxRetries int           // S3 업로드 재시도 횟수
+	S3Timeout    time.Duration // 각 S3 PutObject 시도당 timeout
+	S3AppRetries int           // S3 업로드 재시도 횟수 (SDK retry는 항상 0)
 
 	// ---------------------------
 	// 로컬 DLQ (Dead Letter Queue)
 	// ---------------------------
 
-	DLQDir          string        // 로컬에 저장할 DLQ 디렉토리 경로
-	DLQMaxAge       time.Duration // DLQ 파일 TTL (지나면 삭제)
-	DLQMaxSizeBytes int64         // DLQ 디렉토리 전체 허용 용량 (바이트)
+	DLQDir          string        // 로컬 DLQ 디렉토리 경로
+	DLQMaxAge       time.Duration // DLQ 파일 TTL (초과 시 삭제)
+	DLQMaxSizeBytes int64         // DLQ 전체 허용 용량 (바이트)
 }
 
 // Load
 //
 // 환경 변수 기반으로 Config 값을 초기화한다.
 // 필수 env 가 비어있으면 즉시 프로세스를 종료(fail-fast).
-// 환경 변수는 인프라/배포 환경에서 반드시 설정해야 하는 값들이다.
+// 운영/배포 환경에서 반드시 설정해야 하는 값들이다.
 func Load() Config {
 	return Config{
 		AWSRegion: must("AWS_REGION"),
@@ -86,7 +91,7 @@ func Load() Config {
 		FlushInterval: mustDur("FLUSH_INTERVAL"),
 
 		S3Timeout:    mustDur("S3_TIMEOUT"),
-		S3MaxRetries: mustInt("S3_MAX_RETRIES"),
+		S3AppRetries: mustInt("S3_APP_RETRIES"),
 
 		DLQDir:          must("DLQ_DIR"),
 		DLQMaxAge:       mustDur("DLQ_MAX_AGE"),
@@ -97,8 +102,8 @@ func Load() Config {
 // must / mustInt / mustInt64 / mustDur
 //
 // 공통 패턴.
-// 필수 환경변수가 없거나, 형식이 잘못되면 즉시 로그 출력 후 종료한다.
-// 런타임 중 설정 오류를 겪지 않도록 하기 위한 fail-fast 전략.
+// 필수 환경변수가 없거나 형식이 잘못되면 즉시 로그 출력 후 종료(fail-fast).
+// 런타임 중 설정 오류를 겪지 않도록 하기 위한 보호 전략.
 func must(key string) string {
 	v := os.Getenv(key)
 	if v == "" {
@@ -136,10 +141,9 @@ func mustDur(key string) time.Duration {
 
 // fallbackInstanceID
 //
-// 이 인스턴스를 식별하는 고유 값.
-//   - 가능한 경우 hostname 사용
-//   - Kubernetes/ECS/Fargate 환경에서는 hostname 자체가 고유 ID 역할을 함
-//   - 실패하거나 공백이면 12자리 랜덤 hex 값 생성
+// 이 ingest 서버 인스턴스를 식별하는 고유 값.
+//   - 기본: hostname (ECS/Fargate에서는 task-id 형태로 고유)
+//   - fallback: 12자리 랜덤 hex
 func fallbackInstanceID() string {
 	if h, err := os.Hostname(); err == nil && h != "" {
 		return h
