@@ -82,11 +82,11 @@ Memory Pool (sync.Pool): 요청마다 객체를 생성하지 않고, 미리 할�
 Event Channel (EventCh): 트래픽이 폭주할 때 일시적으로 요청을 담아두는 1차 댐(Dam) 역할을 합니다. 큐가 가득 차면 즉시 503 에러를 반환하여 서버가 다운되는 것을 방지합니다(Backpressure).
 
 ### ⚙️ 2.2 Worker Layer (작업 계층)
-Collect Worker: 개별 이벤트를 모아 **배치(Batch)**로 만듭니다. BatchSize(개수) 또는 FlushInterval(시간) 조건 중 하나라도 충족되면 다음 단계로 넘깁니다.
+Collect Worker: 개별 이벤트를 모아 **배치(Batch)** 로 만듭니다. BatchSize(개수) 또는 FlushInterval(시간) 조건 중 하나라도 충족되면 다음 단계로 넘깁니다.
 
 Upload Worker: 배치를 받아 Gzip 압축 + JSONL 변환을 수행하고 S3로 업로드합니다. 가장 많은 CPU 자원을 사용하는 구간입니다.
 
 ### 🛡️ 2.3 Reliability Layer (안정성 계층)
 App-Level Retry: AWS SDK의 무거운 재시도 로직 대신, 가볍고 빠른 자체 재시도 루프를 사용합니다.
 
-Circuit Breaker (DLQ): S3 업로드가 실패하면, 데이터를 메모리에 들고 있는 대신 즉시 **로컬 디스크(/tmp/dlq)**에 씁니다. 이를 통해 서버 메모리 고갈을 막고 데이터 유실을 방지합니다.
+Circuit Breaker (DLQ): S3 업로드가 실패하면, 데이터를 메모리에 들고 있는 대신 즉시 **로컬 디스크(/tmp/dlq)** 에 씁니다. 이를 통해 서버 메모리 고갈을 막고 데이터 유실을 방지합니다.
