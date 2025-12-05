@@ -176,17 +176,24 @@ func (m *Manager) collectLoop() {
 	}
 }
 
-// uploadLoop 는 uploadCh 에서 배치를 꺼내어 실제 업로드를 수행한다.
+// uploadLoop 는 uploadCh 에서 배치를 꺼내 실제 업로드를 수행한다.
 //
-// 작업 순서:
+// 주요 책임:
 //  1. 배치 인코딩 (JSONL + gzip)
 //  2. S3 RAW prefix 로 업로드 (실패 시 로컬 DLQ 저장)
-//  3. 틈틈이 DLQ 재업로드 (ProcessOneCtx)
+//  3. idle 상태일 때만 DLQ 재업로드를 소량 수행 (ProcessOneCtx)
+//
+// 중요 설계 원칙:
+//   - UploadLoop는 ingest 서버의 "핫 패스(hot path)"이다.
+//   - 업로드가 지연되면 UploadCh 가 막혀 backpressure 가 발생하므로,
+//     업로드 처리 중에는 DLQ 처리를 절대 섞지 않는다.
+//   - DLQ 처리는 서버가 idle 일 때만 1건씩 천천히 처리하여
+//     UploadLoop 성능을 침해하지 않도록 설계한다.
 //
 // 종료 조건:
-//   - collectLoop 가 uploadCh 를 닫으면 range/recv 에서 ok=false 가 되어 종료된다.
-//   - 별도로 ctx.Done() 을 select 하여 강제 종료하지 않는다.
-//     (그렇게 하면 uploadCh 에 남은 배치가 처리되지 못하고 유실될 수 있음)
+//   - collectLoop 가 uploadCh 를 닫으면 recv 시 ok=false 가 되어 종료된다.
+//   - ctx.Done() 을 select 로 감시하지 않는다.
+//     (ctx 취소 시 premature termination 발생 → UploadCh 잔여 배치 유실 위험)
 func (m *Manager) uploadLoop() {
 	defer m.wg.Done()
 
@@ -195,25 +202,27 @@ func (m *Manager) uploadLoop() {
 
 	for {
 		select {
+
+		// 1) 업로드 작업 우선 처리 (핫 패스)
 		case job, ok := <-m.uploadCh:
 			if !ok {
 				log.Println("[INFO] uploader exiting")
 				return
 			}
 
-			// 이벤트 배치 처리 (인코딩 + S3 업로드 + 로컬 DLQ 저장)
+			// - JSONL + gzip 인코딩
+			// - S3 RAW 업로드
+			// - 실패 시 로컬 DLQ 저장
 			m.processUploadCtx(m.ctx, job)
 
-			// DLQ starvation 방지: 매 배치 처리 후 최소 N건 재업로드 시도
-			for i := 0; i < 3; i++ {
-				m.dlq.ProcessOneCtx(m.ctx)
-			}
+			// 업로드가 진행되고 있는 동안에는 DLQ 를 건드리지 않는다.
+			// (업로드 경로의 throughput 저하 방지)
 
+		// 2) idle 상태일 때만 DLQ 재처리 1건 진행
 		case <-ticker.C:
-			// idle 상태에서도 주기적으로 DLQ 재처리를 진행한다.
-			for i := 0; i < 3; i++ {
-				m.dlq.ProcessOneCtx(m.ctx)
-			}
+			// UploadLoop 가 당장 처리할 job 이 없는 경우에만
+			// DLQ 파일 한 건을 재업로드 시도한다.
+			m.dlq.ProcessOneCtx(m.ctx)
 		}
 	}
 }
