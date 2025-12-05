@@ -318,49 +318,77 @@ func (d *DLQManager) validateFile(f *os.File, size int64) bool {
 	return json.Unmarshal(line, &tmp) == nil
 }
 
-// pickOldest는 DLQ 디렉토리에 있는 data 파일 중
-// 파일명 기준(=timestamp 기준)으로 가장 오래된 파일을 반환한다.
+// pickOldest는 DLQ 디렉토리에 있는 데이터 파일들 중,
+// "부분 스캔(partial scan)"을 이용해 가장 오래된 파일을 선택한다.
 //
-// 주의:
-//   - 파일 시스템은 엔트리 목록을 정렬해주지 않는다.
-//   - 따라서 Readdir() 결과는 임의 순서이며 반드시 정렬이 필요하다.
-//   - DLQ 파일명은 <unix>_<instance>_<counter>.jsonl.gz 이므로
-//     문자열 정렬 = 시간 정렬 = 처리 순서 보장이 가능하다.
+// ------------------------------------------------------------
+// [운영 최적화: Partial Scan 방식 적용]
+// ------------------------------------------------------------
+// 장애 상황(예: S3 장애)에서 DLQ 파일이 수천~수만 개까지 쌓일 수 있다.
+// 기존의 전체 스캔(ReadDir → 전체 정렬) 방식은 O(N log N) 특성 때문에
+// 파일 수가 많아지면 CPU/I/O가 폭증하여 ingest 서버 전체가 응답을 못하게 된다.
+//
+// 이를 방지하기 위해 다음 전략을 사용한다:
+//
+//  1. 디렉토리에서 최대 1,000개만 읽어온다 (Readdirnames).
+//     - 디렉토리 전체 크기(N)에 관계없이 항상 일정한 비용으로 동작한다.
+//     - 실제 파일 수가 1천개든 10만개든 처리 비용은 동일(상수 시간).
+//
+//  2. 이 1,000개(또는 그 이하)의 후보군만 정렬한다.
+//     - 1천개 이하 정렬 비용은 미미하므로 CPU 부담이 없다.
+//
+//  3. 이 후보군에서 가장 오래된 파일을 선택한다.
+//     - 파일명에 timestamp가 포함되므로 문자열 정렬로 시간순 정렬이 가능함.
+//
+// 운영적 판단:
+//   - DLQ는 "가능하면 재업로드, 아니면 TTL 지나면 삭제"가 목적이므로
+//     전통적 의미의 완전한 FIFO가 아니라도 충분하다.
+//   - 파일 삭제/추가로 인해 디렉토리 엔트리 순서는 지속적으로 변하므로,
+//     partial scan만으로도 장기적으로 모든 파일이 처리될 가능성이 높다.
+//   - 장애 상황에서도 ingest 서버의 안정성을 최우선으로 보장하는 설계이다.
+//
+// ------------------------------------------------------------
 func (d *DLQManager) pickOldest() string {
-	// DLQ 디렉토리에서 전체 엔트리를 읽는다.
-	entries, err := os.ReadDir(d.cfg.DLQDir)
+	// 1. 디렉토리 열기
+	f, err := os.Open(d.cfg.DLQDir)
 	if err != nil {
 		return ""
 	}
+	defer f.Close()
 
-	// data 파일명만 수집 (meta 제외)
-	var files []string
-	files = make([]string, 0, len(entries))
-
-	for _, e := range entries {
-		name := e.Name()
-
-		// meta 파일은 제외
-		if strings.HasSuffix(name, ".meta.json") {
-			continue
-		}
-
-		// 숨김 파일, 비정상 파일 제외
-		if name == "" || name[0] == '.' {
-			continue
-		}
-
-		files = append(files, name)
-	}
-
-	if len(files) == 0 {
+	// 2. Partial Scan: 최대 1,000개의 파일명만 읽어온다.
+	// - 전체를 다 읽지 않으므로 O(K) 파일 스캔 성능을 보장한다.
+	// - Readdirnames는 빈 문자열을 반환하지 않으므로 별도의 빈 값 검사는 불필요하다.
+	names, err := f.Readdirnames(1000)
+	if err != nil && len(names) == 0 {
+		// 읽을 파일이 없거나(EOF), 디렉토리 읽기 실패 시
 		return ""
 	}
 
-	// lexicographical sort → timestamp 순 정렬
-	sort.Strings(files)
+	// 3. 유효한 데이터 파일 필터링
+	// - .meta.json 파일 제외
+	// - 숨김 파일(.으로 시작) 제외
+	var candidates []string
+	for _, name := range names {
+		// Readdirnames는 빈 이름을 반환하지 않으므로 name[0] 접근은 안전하다.
+		if strings.HasSuffix(name, ".meta.json") || name[0] == '.' {
+			continue
+		}
+		candidates = append(candidates, name)
+	}
 
-	return files[0] // 가장 오래된 파일
+	// 유효한 파일이 하나도 없는 경우
+	if len(candidates) == 0 {
+		return ""
+	}
+
+	// 4. 배치 내 정렬 (In-Memory Sort)
+	// - 1,000개 이내의 소량 데이터이므로 CPU 비용은 무시할 수 있는 수준이다.
+	// - 파일명에 Unix Timestamp가 포함되어 있으므로 문자열 정렬로 시간순 정렬이 된다.
+	sort.Strings(candidates)
+
+	// 배치 내에서 가장 오래된 파일 반환
+	return candidates[0]
 }
 
 // extractUnixFromFilename 은 DLQ 파일명 prefix 에서 Unix seconds 를 파싱한다.
