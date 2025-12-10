@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"context"
 	"io"
-	"log"
 	"sync/atomic"
 	"time"
 
@@ -15,6 +14,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsCfgLib "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/rs/zerolog/log"
 )
 
 // S3Uploader는 S3 업로드 기능을 담당하는 구성 요소이다.
@@ -47,7 +47,7 @@ func newS3Client(cfg config.Config) *s3.Client {
 		awsCfgLib.WithRegion(cfg.AWSRegion),
 	)
 	if err != nil {
-		log.Fatalf("[FATAL] failed to load AWS config: %v", err)
+		log.Fatal().Err(err).Msg("failed to load AWS config")
 	}
 
 	client := s3.NewFromConfig(awsCfg, func(o *s3.Options) {
@@ -91,6 +91,12 @@ func (u *S3Uploader) UploadBytesWithRetryCtx(
 		} else {
 			lastErr = err
 			atomic.AddInt64(&u.metrics.S3PutErrorsTotal, 1)
+
+			log.Warn().
+				Err(err).
+				Str("key", key).
+				Int("attempt", attempt).
+				Msg("S3 upload failed, will retry")
 		}
 
 		// backoff 적용 (최대 2초)
@@ -103,6 +109,15 @@ func (u *S3Uploader) UploadBytesWithRetryCtx(
 				backoff = 2 * time.Second
 			}
 		}
+	}
+
+	// 모든 재시도 실패
+	if lastErr != nil {
+		log.Error().
+			Err(lastErr).
+			Str("key", key).
+			Int("retries", u.cfg.S3AppRetries).
+			Msg("S3 upload failed after all retries")
 	}
 
 	return lastErr
@@ -133,12 +148,17 @@ func (u *S3Uploader) UploadFileWithRetryCtx(
 		default:
 		}
 
-		// 실제 업로드 호출
 		if err := u.putObject(ctx, key, f, size); err == nil {
 			return nil
 		} else {
 			lastErr = err
 			atomic.AddInt64(&u.metrics.S3PutErrorsTotal, 1)
+
+			log.Warn().
+				Err(err).
+				Str("key", key).
+				Int("attempt", attempt).
+				Msg("DLQ reupload failed, will retry")
 		}
 
 		// backoff 적용
@@ -152,8 +172,17 @@ func (u *S3Uploader) UploadFileWithRetryCtx(
 			}
 		}
 
-		// retry 시 파일 포인터를 처음으로 되돌린다 (반드시 필요)
+		// retry 시 파일 포인터 초기화
 		f.Seek(0, io.SeekStart)
+	}
+
+	// 모든 재시도 실패
+	if lastErr != nil {
+		log.Error().
+			Err(lastErr).
+			Str("key", key).
+			Int("retries", u.cfg.S3AppRetries).
+			Msg("DLQ reupload failed after all retries")
 	}
 
 	return lastErr

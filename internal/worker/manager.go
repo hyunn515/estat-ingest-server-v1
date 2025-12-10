@@ -4,7 +4,6 @@ package worker
 import (
 	"bytes"
 	"context"
-	"log"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -12,6 +11,8 @@ import (
 	"estat-ingest/internal/config"
 	"estat-ingest/internal/metrics"
 	"estat-ingest/internal/model"
+
+	"github.com/rs/zerolog/log"
 )
 
 // Manager는 ingest 파이프라인의 중앙 조정자이다.
@@ -206,7 +207,6 @@ func (m *Manager) uploadLoop() {
 		// 1) 업로드 작업 우선 처리 (핫 패스)
 		case job, ok := <-m.uploadCh:
 			if !ok {
-				log.Println("[INFO] uploader exiting")
 				return
 			}
 
@@ -271,7 +271,7 @@ func (m *Manager) processUploadCtx(ctx context.Context, job model.UploadJob) {
 	if err := m.s3.UploadBytesWithRetryCtx(ctx, key, data); err != nil {
 		// 업로드 실패 → 로컬 DLQ 로 저장
 		if err2 := m.dlq.Save(data, len(job.Events)); err2 != nil {
-			log.Printf("[ERROR] local DLQ save failed: %v", err2)
+			log.Error().Err(err2).Msg("local DLQ save failed")
 		}
 	} else {
 		// 업로드 성공 → 저장된 이벤트 수를 metric 으로 기록

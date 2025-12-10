@@ -7,7 +7,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -21,6 +20,7 @@ import (
 
 	json "github.com/goccy/go-json"
 	"github.com/klauspost/compress/gzip"
+	"github.com/rs/zerolog/log"
 )
 
 // DLQManager 는 S3 업로드 실패 배치를 로컬 디스크에 저장하고,
@@ -103,9 +103,16 @@ func (d *DLQManager) Save(data []byte, numEvents int) error {
 
 	size := int64(len(data))
 	if !d.ensureCapacity(size) {
-		// 용량 부족: 가장 오래된 파일들 정리했지만 여전히 공간 부족 → drop
-		log.Printf("[ERROR] DLQ full → drop bytes=%d events=%d", size, numEvents)
-		atomic.AddInt64(&d.metrics.DLQEventsDroppedTotal, int64(numEvents))
+		n := atomic.AddInt64(&d.metrics.DLQEventsDroppedTotal, int64(numEvents))
+		// 용량 부족: 가장 오래된 파일들 정리했지만 여전히 공간 부족 → drop (샘플링: 1,000)
+		if n%1000 == 0 {
+			log.Error().
+				Int64("bytes", size).
+				Int("events", numEvents).
+				Int64("dropped_total", n).
+				Msg("DLQ full → dropping batches")
+		}
+
 		return nil
 	}
 
@@ -115,6 +122,10 @@ func (d *DLQManager) Save(data []byte, numEvents int) error {
 
 	// data 파일 저장
 	if err := os.WriteFile(dataPath, data, 0o600); err != nil {
+		log.Error().
+			Err(err).
+			Str("path", dataPath).
+			Msg("DLQ write failed")
 		return err
 	}
 
@@ -166,7 +177,9 @@ func (d *DLQManager) ensureCapacity(incoming int64) bool {
 		atomic.AddInt64(&d.metrics.DLQFilesCurrent, -1)
 		atomic.AddInt64(&d.metrics.DLQFilesExpiredTotal, 1)
 
-		log.Printf("[WARN] DLQ capacity → removed=%s", oldest)
+		log.Warn().
+			Str("file", oldest).
+			Msg("DLQ capacity → removed")
 	}
 }
 
@@ -195,6 +208,10 @@ func (d *DLQManager) ProcessOneCtx(ctx context.Context) {
 		_ = os.Remove(dataPath)
 		_ = os.Remove(metaPath)
 		atomic.AddInt64(&d.metrics.DLQFilesCurrent, -1)
+
+		log.Warn().
+			Str("file", name).
+			Msg("DLQ file missing → cleaned")
 		return
 	}
 
@@ -203,7 +220,7 @@ func (d *DLQManager) ProcessOneCtx(ctx context.Context) {
 	// --- TTL 판단: 파일명 prefix 의 Unix timestamp 기반 ---
 	if d.cfg.DLQMaxAge > 0 {
 		if sec, ok := extractUnixFromFilename(name); ok && sec > 0 {
-			nowSec := Unix() // worker timecache (epoch seconds)
+			nowSec := Unix()
 			age := time.Duration(nowSec-sec) * time.Second
 			if age > d.cfg.DLQMaxAge {
 				// TTL 초과 → 삭제
@@ -215,7 +232,10 @@ func (d *DLQManager) ProcessOneCtx(ctx context.Context) {
 				atomic.AddInt64(&d.metrics.DLQFilesCurrent, -1)
 				atomic.AddInt64(&d.metrics.DLQFilesExpiredTotal, 1)
 
-				log.Printf("[INFO] DLQ TTL expired → deleted=%s age=%s", name, age.String())
+				log.Info().
+					Str("file", name).
+					Str("age", age.String()).
+					Msg("DLQ TTL expired → deleted")
 				return
 			}
 		}
@@ -232,7 +252,10 @@ func (d *DLQManager) ProcessOneCtx(ctx context.Context) {
 	// data 파일 open
 	f, err := os.Open(dataPath)
 	if err != nil {
-		log.Printf("[WARN] DLQ open failed: %s err=%v", name, err)
+		log.Warn().
+			Str("file", name).
+			Err(err).
+			Msg("DLQ open failed")
 		return
 	}
 	defer f.Close()
@@ -242,7 +265,10 @@ func (d *DLQManager) ProcessOneCtx(ctx context.Context) {
 
 	// 재업로드 전에 rewind
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		log.Printf("[WARN] DLQ seek failed: %s err=%v", name, err)
+		log.Warn().
+			Str("file", name).
+			Err(err).
+			Msg("DLQ seek failed")
 		return
 	}
 
@@ -255,7 +281,10 @@ func (d *DLQManager) ProcessOneCtx(ctx context.Context) {
 	}
 
 	if err := d.uploader.UploadFileWithRetryCtx(ctx, key, f, size); err != nil {
-		log.Printf("[WARN] DLQ reupload failed: %s err=%v", key, err)
+		log.Warn().
+			Str("s3_key", key).
+			Err(err).
+			Msg("DLQ reupload failed")
 		return
 	}
 
@@ -280,9 +309,15 @@ func (d *DLQManager) ProcessOneCtx(ctx context.Context) {
 	atomic.AddInt64(&d.metrics.DLQEventsReuploadedTotal, numEvents)
 
 	if valid {
-		log.Printf("[INFO] DLQ → RAW success: %s events=%d", key, numEvents)
+		log.Info().
+			Str("s3_key", key).
+			Int64("events", numEvents).
+			Msg("DLQ → RAW success")
 	} else {
-		log.Printf("[INFO] DLQ → RAW_DLQ success: %s events=%d", key, numEvents)
+		log.Info().
+			Str("s3_key", key).
+			Int64("events", numEvents).
+			Msg("DLQ → RAW_DLQ success")
 	}
 }
 
@@ -352,6 +387,10 @@ func (d *DLQManager) pickOldest() string {
 	// 1. 디렉토리 열기
 	f, err := os.Open(d.cfg.DLQDir)
 	if err != nil {
+		log.Warn().
+			Err(err).
+			Str("dir", d.cfg.DLQDir).
+			Msg("DLQ dir open failed")
 		return ""
 	}
 	defer f.Close()

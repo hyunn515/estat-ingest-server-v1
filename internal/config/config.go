@@ -31,8 +31,35 @@ type Config struct {
 	// 서버 식별자 / 네트워크
 	// ---------------------------
 
-	InstanceID string // ingest 프로세스 고유 ID (호스트명 기반, 실패 시 랜덤 hex)
-	HTTPAddr   string // HTTP 서버 bind 주소 (예: ":8080")
+	ServiceName string // ingest 서비스 이름 (로깅용 태그)
+	InstanceID  string // ingest 프로세스 고유 ID (호스트명 기반, 실패 시 랜덤 hex)
+	HTTPAddr    string // HTTP 서버 bind 주소 (예: ":8080")
+
+	// ---------------------------
+	// 로깅 설정
+	// ---------------------------
+	// 로그 설정은 "서비스 동작"에는 영향을 주지 않지만,
+	// 운영 시 로그 볼륨 조절과 개발 환경에서의 가독성을 위해 제공된다.
+	// 값이 비어있거나 잘못되어도 기본값으로 대체되며, 프로세스를 죽이지 않는다.
+	// --------------------------------------------
+	// LogLevel:
+	//   - 최소 출력 레벨. 이 레벨보다 낮은 로그는 버려진다.
+	//   - 예: "debug" | "info" | "warn" | "error"
+	//   - 비어있으면 "info" 로 동작한다.
+	//
+	// LogPretty:
+	//   - true  → 개발용 텍스트(콘솔) 포맷
+	//   - false → JSON 포맷 (운영/수집 시스템에서 사용하기 적합)
+	//
+	// LogSampleN:
+	//   - Info/Debug 로그에 대한 샘플링 계수.
+	//   - 1 이면 샘플링 없음(모두 출력), N 이면 대략 1/N 로그만 출력.
+	//   - Error/Warn 레벨은 샘플링 대상이 아니다(항상 출력).
+	// --------------------------------------------
+
+	LogLevel   string // 최소 로그 레벨 문자열 (비어있으면 "info")
+	LogPretty  bool   // 사람이 읽기 쉬운 pretty logging 사용 여부
+	LogSampleN int    // Info/Debug 로그 샘플링 계수 (1=샘플링 없음)
 
 	// ---------------------------
 	// 요청 처리 파라미터
@@ -81,8 +108,13 @@ func Load() Config {
 		RawPrefix: must("RAW_PREFIX"),
 		DLQPrefix: must("DLQ_PREFIX"),
 
-		InstanceID: fallbackInstanceID(),
-		HTTPAddr:   must("HTTP_ADDR"),
+		ServiceName: "estat-ingest",
+		InstanceID:  fallbackInstanceID(),
+		HTTPAddr:    must("HTTP_ADDR"),
+
+		LogLevel:   getenvDefault("LOG_LEVEL", "info"),
+		LogPretty:  optBool("LOG_PRETTY", false),
+		LogSampleN: optInt("LOG_SAMPLE_N", 1),
 
 		MaxBodySize:   mustInt64("MAX_BODY_SIZE"),
 		ChannelSize:   mustInt("CHANNEL_SIZE"),
@@ -137,6 +169,54 @@ func mustDur(key string) time.Duration {
 		log.Fatalf("invalid duration env %s=%q: %v", key, v, err)
 	}
 	return d
+}
+
+// 선택적(optional) 환경변수 유틸리티
+//
+// - 필수값이 아니기 때문에, 비어 있거나 잘못되더라도 프로세스를 종료하지 않는다.
+// - 잘못된 값은 로그 한 줄 남기고 기본값으로 대체한다.
+//
+// 로그 관련 설정(LOG_LEVEL, LOG_PRETTY, LOG_SAMPLE_N)은
+// 여기 함수들을 통해 초기화된다.
+
+func getenvDefault(key, def string) string {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	return v
+}
+
+func optBool(key string, def bool) bool {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	// strconv.ParseBool 은 "1", "t", "T", "TRUE", "true", "True" 등을 true 로 인식.
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		log.Printf("invalid bool env %s=%q: %v (fallback=%v)", key, v, err, def)
+		return def
+	}
+	return b
+}
+
+func optInt(key string, def int) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		log.Printf("invalid int env %s=%q: %v (fallback=%d)", key, v, err, def)
+		return def
+	}
+	if n <= 0 {
+		// 샘플링 계수 등에서 0 이하는 의미가 없으므로 기본값으로 되돌린다.
+		log.Printf("non-positive int env %s=%q: fallback=%d", key, v, def)
+		return def
+	}
+	return n
 }
 
 // fallbackInstanceID
