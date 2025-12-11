@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	stdjson "encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -321,36 +322,44 @@ func (d *DLQManager) ProcessOneCtx(ctx context.Context) {
 	}
 }
 
-// validateFile 은 gzip 을 풀어 첫 번째 JSONL 라인이 유효한 JSON 인지 검사한다.
-// 유효하면 RAW 로, 아니면 RAW_DLQ 로 보낸다.
+// validateFile
+//
+// gzip 파일의 첫 번째 줄을 읽어 유효한 JSON인지 검사한다.
+// 전체 파일을 파싱하지 않고 첫 줄만 검사하여 CPU를 절약한다.
 func (d *DLQManager) validateFile(f *os.File, size int64) bool {
 	if size <= 0 {
 		return false
 	}
 
+	// 파일 포인터 초기화
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
 		return false
 	}
 
+	// Gzip Reader 생성
 	gz, err := gzip.NewReader(f)
 	if err != nil {
-		return false
+		return false // 헤더 손상 등
 	}
 	defer gz.Close()
 
+	// 첫 줄만 읽기 (bufio 사용)
 	reader := bufio.NewReader(gz)
 	line, err := reader.ReadBytes('\n')
 	if err != nil && err != io.EOF {
-		return false
+		return false // 읽기 중 에러
 	}
 
 	line = bytes.TrimSpace(line)
 	if len(line) == 0 {
-		return false
+		return false // 빈 파일
 	}
 
-	var tmp map[string]interface{}
-	return json.Unmarshal(line, &tmp) == nil
+	// [최적화]
+	// 기존: json.Unmarshal -> map[string]interface{} 할당 + Reflection (CPU High)
+	// 변경: stdjson.Valid -> 바이트 스캔만 수행 (CPU Low, Memory 0)
+	// 0.25 vCPU 환경에서 복구 작업이 메인 업로드 로직을 방해하지 않게 함.
+	return stdjson.Valid(line)
 }
 
 // pickOldest는 DLQ 디렉토리에 있는 데이터 파일들 중,

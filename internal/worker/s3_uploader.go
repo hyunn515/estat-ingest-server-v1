@@ -58,13 +58,13 @@ func newS3Client(cfg config.Config) *s3.Client {
 }
 
 // UploadBytesWithRetryCtx
-// -----------------------
+//
 // 메모리에 이미 존재하는 gzip+JSONL 바이트 배열을 S3로 업로드한다.
 // - 각 업로드는 5초 timeout
 // - retry + exponential backoff 포함
 // - shutdown-safe: ctx.Done() 시 즉시 중단
 //
-// body는 매 재시도마다 reader를 새로 만들어야 하므로 bytes.NewReader 사용.
+// [최적화] 타이머 리소스 관리 (NewTimer)
 func (u *S3Uploader) UploadBytesWithRetryCtx(
 	ctx context.Context,
 	key string,
@@ -76,18 +76,17 @@ func (u *S3Uploader) UploadBytesWithRetryCtx(
 
 	for attempt := 1; attempt <= u.cfg.S3AppRetries; attempt++ {
 
-		// shutdown 체크
+		// 1. Shutdown 신호 감지 (Fast check)
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
 		}
 
+		// 2. 업로드 시도 (Reader 생성 비용은 매우 저렴)
 		reader := bytes.NewReader(body)
-
-		// 실제 S3 업로드
 		if err := u.putObject(ctx, key, reader, int64(len(body))); err == nil {
-			return nil
+			return nil // 성공
 		} else {
 			lastErr = err
 			atomic.AddInt64(&u.metrics.S3PutErrorsTotal, 1)
@@ -99,19 +98,25 @@ func (u *S3Uploader) UploadBytesWithRetryCtx(
 				Msg("S3 upload failed, will retry")
 		}
 
-		// backoff 적용 (최대 2초)
+		// 3. Backoff 대기 (Timer 최적화)
+		// time.After()는 함수가 리턴될 때까지 GC되지 않는 메모리 누수 가능성이 있음.
+		// NewTimer + Stop 패턴으로 리소스를 즉시 해제한다.
+		timer := time.NewTimer(backoff)
 		select {
 		case <-ctx.Done():
+			timer.Stop() // 컨텍스트 취소 시 타이머 즉시 해제
 			return ctx.Err()
-		case <-time.After(backoff):
-			backoff *= 2
-			if backoff > 2*time.Second {
-				backoff = 2 * time.Second
-			}
+		case <-timer.C:
+			// 대기 완료, 다음 루프 진행 (timer는 GC됨)
+		}
+
+		// Backoff 증가 (최대 2초)
+		backoff *= 2
+		if backoff > 2*time.Second {
+			backoff = 2 * time.Second
 		}
 	}
 
-	// 모든 재시도 실패
 	if lastErr != nil {
 		log.Error().
 			Err(lastErr).

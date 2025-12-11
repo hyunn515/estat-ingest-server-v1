@@ -11,6 +11,7 @@ import (
 	"estat-ingest/internal/config"
 	"estat-ingest/internal/metrics"
 	"estat-ingest/internal/model"
+	"estat-ingest/internal/pool"
 
 	"github.com/rs/zerolog/log"
 )
@@ -228,10 +229,9 @@ func (m *Manager) uploadLoop() {
 }
 
 // processUploadCtx 는 하나의 이벤트 배치에 대해
-//  1. JSONL + gzip 인코딩
+//  1. JSONL + gzip 인코딩 (Zero-Copy)
 //  2. S3 업로드 (실패 시 로컬 DLQ 저장)
-//  3. 성공/실패에 따른 metrics 업데이트
-//  4. 이벤트 객체 재사용을 위한 Pool 반환
+//  3. 사용 완료된 버퍼 반환 및 이벤트 객체 재사용
 //
 // 을 수행한다.
 func (m *Manager) processUploadCtx(ctx context.Context, job model.UploadJob) {
@@ -239,42 +239,47 @@ func (m *Manager) processUploadCtx(ctx context.Context, job model.UploadJob) {
 		return
 	}
 
-	// --- 1) JSONL + gzip 인코딩 ---
-	data, err := m.encoder.EncodeBatchJSONLGZ(job.Events)
+	// --- 1) JSONL + gzip 인코딩 (Zero-Copy) ---
+	// 메모리 할당을 최소화하기 위해 복사본이 아닌 원본 버퍼(*bytes.Buffer)를 받아온다.
+	buf, err := m.encoder.EncodeBatchJSONLGZ(job.Events)
 	if err != nil {
-		// 인코딩 실패는 매우 드문 경우 → 원본 JSONL 을 그대로 RAW_DLQ 로 보낸다.
-		// (인코딩 문제이므로 DLQManager.Save 사용 대신 직접 업로드)
+		// 인코딩 실패는 매우 드문 경우 (데이터 깨짐 등)
 		atomic.AddInt64(&m.metrics.S3PutErrorsTotal, 1)
 
-		var buf bytes.Buffer
+		// 인코딩 실패 시 원본 텍스트로라도 저장 시도 (Fallback)
+		var txtBuf bytes.Buffer
 		for _, ev := range job.Events {
-			buf.WriteString(ev.Body)
-			buf.WriteByte('\n')
+			txtBuf.WriteString(ev.Body)
+			txtBuf.WriteByte('\n')
 		}
 
 		name := NewFilename(m.cfg.InstanceID)
 		key := BuildS3Key(m.cfg.DLQPrefix, name)
 
-		// 인코딩 실패 시 업로드도 best-effort (실패해도 추가 조치는 하지 않음)
-		_ = m.s3.UploadBytesWithRetryCtx(ctx, key, buf.Bytes())
+		_ = m.s3.UploadBytesWithRetryCtx(ctx, key, txtBuf.Bytes())
 		atomic.AddInt64(&m.metrics.DLQEventsEnqueuedTotal, int64(len(job.Events)))
 
-		// 이벤트 객체는 항상 Pool 로 반환
 		m.encoder.RecycleEvents(job.Events)
 		return
 	}
+
+	// [중요] 함수 종료 시(성공이든 실패든) 무조건 버퍼를 Pool에 반환한다.
+	// 1MB 이상인 경우 Pool 내부 정책에 따라 버려지므로 안전하다.
+	defer pool.PutBuffer(buf)
 
 	// --- 2) 정상 인코딩 → S3 RAW 업로드 ---
 	name := NewFilename(m.cfg.InstanceID)
 	key := BuildS3Key(m.cfg.RawPrefix, name)
 
-	if err := m.s3.UploadBytesWithRetryCtx(ctx, key, data); err != nil {
+	// buf.Bytes()는 슬라이스 헤더만 참조하므로 메모리 복사가 없다.
+	if err := m.s3.UploadBytesWithRetryCtx(ctx, key, buf.Bytes()); err != nil {
 		// 업로드 실패 → 로컬 DLQ 로 저장
-		if err2 := m.dlq.Save(data, len(job.Events)); err2 != nil {
+		// 여기서도 buf.Bytes()를 그대로 사용하므로 추가 할당 없음
+		if err2 := m.dlq.Save(buf.Bytes(), len(job.Events)); err2 != nil {
 			log.Error().Err(err2).Msg("local DLQ save failed")
 		}
 	} else {
-		// 업로드 성공 → 저장된 이벤트 수를 metric 으로 기록
+		// 업로드 성공
 		atomic.AddInt64(&m.metrics.S3EventsStoredTotal, int64(len(job.Events)))
 	}
 

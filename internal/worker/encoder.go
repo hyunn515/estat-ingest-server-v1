@@ -13,39 +13,34 @@ import (
 // Encoder 는 이벤트 배치를 JSONL → gzip 형태로 직렬화하는 컴포넌트.
 // 전체 ingest 파이프라인에서 CPU 사용량과 메모리 사용량에
 // 가장 큰 영향을 주는 핵심 구간이다.
-//
-// 특징:
-//   - 고성능 goccy/json 기반 JSON 인코딩
-//   - gzip.Writer + bytes.Buffer 재사용(pool 기반)
-//   - 결과는 최종적으로 새로운 []byte 로 복사해 호출자에게 소유권을 넘김
-//     (pool 버퍼를 그대로 반환하면 데이터 corruption 위험)
 type Encoder struct{}
 
 func NewEncoder() *Encoder {
 	return &Encoder{}
 }
 
-// EncodeBatchJSONLGZ 는 입력 받은 이벤트 slice(배치)를
-// JSONL 형식으로 줄 단위 인코딩한 뒤 gzip 압축해 반환한다.
+// EncodeBatchJSONLGZ
 //
-// 이벤트 수(batch size)가 커질수록 CPU 부하가 매우 높아지므로
-// 운영 배치 크기는 반드시 성능 테스트 기반으로 설정해야 한다.
+// 입력 받은 이벤트 slice(배치)를 JSONL 형식으로 줄 단위 인코딩한 뒤 gzip 압축해 반환한다.
 //
-// 반환값:
-// - data: 압축된 결과의 byte slice(호출자 소유)
-// - err: 인코딩 과정 중 오류 발생 시
-func (e *Encoder) EncodeBatchJSONLGZ(events []*model.Event) ([]byte, error) {
+// [최적화 - Zero Copy Strategy]
+// 기존에는 압축된 데이터를 새로운 []byte에 복사(alloc+copy)하여 반환했으나,
+// 0.5GB 메모리 제한 환경에서는 이 복사 과정이 순간 메모리 피크를 2배로 만든다.
+// 따라서 Pool에서 빌린 *bytes.Buffer 포인터를 그대로 반환한다.
+//
+// 주의:
+//   - 호출자(Manager)는 반환된 버퍼 사용이 끝나면 반드시 pool.PutBuffer(buf)를 호출해야 한다.
+//   - 반환된 버퍼의 소유권은 호출자에게 넘어간다.
+func (e *Encoder) EncodeBatchJSONLGZ(events []*model.Event) (*bytes.Buffer, error) {
 
 	// ------------------------------------------------------------
 	// 1) gzip 결과를 담을 bytes.Buffer 를 pool에서 가져온다.
-	//    (기본 cap=256KB, 1MB 초과 시 pool에 반환하지 않음 — pool.go 참고)
 	// ------------------------------------------------------------
 	buf := pool.BufferPool.Get().(*bytes.Buffer)
 	buf.Reset()
 
 	// ------------------------------------------------------------
 	// 2) gzip.Writer 를 pool에서 가져오고 buffer로 reset
-	//    (gzip.BestSpeed 사용 중)
 	// ------------------------------------------------------------
 	gz := pool.GzipPool.Get().(*gzip.Writer)
 	gz.Reset(buf)
@@ -61,10 +56,10 @@ func (e *Encoder) EncodeBatchJSONLGZ(events []*model.Event) ([]byte, error) {
 	// ------------------------------------------------------------
 	for _, ev := range events {
 		if err := enc.Encode(ev); err != nil {
-			// gzip close 먼저 시도
+			// 실패 시 자원 정리: Gzip Writer 닫고 버퍼 반환
 			_ = gz.Close()
 			pool.GzipPool.Put(gz)
-			pool.PutBuffer(buf)
+			pool.PutBuffer(buf) // 실패했으므로 즉시 반환(폐기)
 			return nil, err
 		}
 	}
@@ -81,24 +76,16 @@ func (e *Encoder) EncodeBatchJSONLGZ(events []*model.Event) ([]byte, error) {
 	pool.GzipPool.Put(gz)
 
 	// ------------------------------------------------------------
-	// 6) buf.Bytes() 를 caller가 소유하는 새로운 slice로 복사
-	//    (pool 버퍼는 재사용되므로 그대로 반환하면 안 됨)
+	// [최적화 핵심]
+	// make([]byte) + copy() 과정을 제거한다.
+	// 5MB 배치를 처리할 때, 복사본을 만들면 순간 10MB가 필요하지만
+	// 포인터만 넘기면 5MB로 끝난다. (OOM 방지 핵심)
 	// ------------------------------------------------------------
-	raw := buf.Bytes()
-	data := make([]byte, len(raw))
-	copy(data, raw)
-
-	// ------------------------------------------------------------
-	// 7) buffer pool로 반환
-	// ------------------------------------------------------------
-	pool.PutBuffer(buf)
-
-	return data, nil
+	return buf, nil
 }
 
 // RecycleEvents 는 이벤트 slice 내 개별 Event 객체를 초기화 후
 // 이벤트 풀에 반환한다.
-// 모델 구조체가 큰 경우 이 재사용으로 GC pressure 감소 효과가 크다.
 func (e *Encoder) RecycleEvents(events []*model.Event) {
 	for _, ev := range events {
 		pool.ResetEvent(ev)

@@ -17,6 +17,7 @@ import (
 	"estat-ingest/internal/server"
 	"estat-ingest/internal/worker"
 
+	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 )
 
@@ -75,10 +76,27 @@ func main() {
 	// 태그(service, instance)는 모든 로그에 자동 추가된다.
 	// ====================================================================
 	logger.Init(cfg)
+
+	// [운영 중요] 서버 시작 시 현재 로드된 설정값을 기록한다.
+	// 배포 실수(예: Prod인데 Dev 버킷 설정, BatchSize 오타 등)를 로그만 보고 즉시 파악 가능.
+	// config.go 검토 결과 민감 정보(Secret/Key)가 없으므로 안전하게 출력한다.
 	log.Info().
-		Str("service", cfg.ServiceName).
-		Str("instance", cfg.InstanceID).
-		Msg("logger initialized")
+		Dict("config", zerolog.Dict().
+			Str("region", cfg.AWSRegion).
+			Str("bucket", cfg.RawBucket).
+			Str("prefix_raw", cfg.RawPrefix).
+			Str("prefix_dlq", cfg.DLQPrefix).
+			Str("addr", cfg.HTTPAddr).
+			Str("log_level", cfg.LogLevel).
+			Bool("log_pretty", cfg.LogPretty).
+			Int("log_sample_n", cfg.LogSampleN).
+			Int64("max_body", cfg.MaxBodySize).
+			Int("batch_size", cfg.BatchSize).
+			Dur("flush_interval", cfg.FlushInterval).
+			Int("s3_retries", cfg.S3AppRetries).
+			Dur("s3_timeout", cfg.S3Timeout),
+		).
+		Msg("server starting with configuration")
 
 	// ====================================================================
 	// Manager 생성 (S3Uploader + DLQManager + Encoder 포함)
